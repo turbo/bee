@@ -1,0 +1,517 @@
+#!/bin/bash
+
+# bee is the built-in eclisp editor, an editor derived from scratch in bash 3.2
+
+# Dependencies: xxd, ncurses(tput)
+
+
+declare -r KMOD='__km__' # Special key unique prefix
+
+declare -r EC_NAME='eclisp'
+declare -r EC_VERSION='0.1-dev'
+
+
+# Editor State (refer to N190330-1)
+
+declare -i T_W=$(( $(tput cols) ))           # Width of terminal window in n chars
+declare -i T_H=$(( $(tput lines) ))          # Height of terminal window in n lines
+declare -i T_M=$(( T_W / 2 - 1 ))            # Midpoint (for L/R status line splitting)
+
+declare -a FILE_C=( 'RESERVED' '' )    # Content of current file as array of lines
+
+declare -i F_H=1            # Number of lines in FILE_C
+
+declare -i V_S=1        # Line number in FILE_C where view buffer starts (max is F_H - 1, displaying one line)
+declare -i V_E=1        # Line number in FILE_C where view buffer ends (also longest line number)
+
+declare -i G_P=1                            # Pad line number in gutter by n columns each side
+declare -i G_W=$(( (G_P * 2) + ${#F_H} ))   # Gutter width in columsn (longest line number, padded by G_P)
+declare -i G_W_OLD=$G_W                      # Detect G_W changes
+declare -i G_RW=1
+
+declare -i V_W=$(( T_W - G_W ))   # Width of view buffer in columns (terminal without gutter)
+declare -i V_H=$(( T_H - 2 ))     # Height of view buffer without the two final status lines
+declare -i V_O=1                  # Offset in current line of FILE_C where V starts (horizontal scrolling)
+
+declare -i C_L=1                  # Current line (1-based) in FILE_C | $(( C_L - 1 )) is the ix
+declare -i C_C=1                  # Current column (1-based) in FILE_C[C_L]
+declare -i C_W=1                  # Width in columns (1-based) of current line in FILE_C
+
+declare -ri MODE_PARTIAL=0
+declare -ri MODE_PAD=1
+
+declare -ri TAB_W=2   # TAB is this many spaces
+
+declare KEY_HANDLER='handle_editor_input' # The function to which parsed keystrokes will be dispatched
+
+function gfx_reset_clear() {
+  tput rc
+  tput clear
+  tput cnorm # Show cursor
+  stty echo # Show input
+}
+
+function clean_exit() {
+  gfx_reset_clear
+  exit 0
+}
+
+function bpanic() {
+  gfx_reset_clear
+  echo "${1}" >&2
+  exit 1
+}
+
+# Checks if the editor is in a valid state by asserting
+# fundamental assumptions about it's constraints
+function state_sanity() {
+  # Terminal must be at least (wxh) 72x3
+  (( T_W >= 72  )) || bpanic "Terminal not wide enough (72)"
+  (( T_H >= 3   )) || bpanic "Terminal not tall enough (3)"
+  (( F_H > 0    )) || bpanic "File content can't be zero"
+  (( V_S > 0    )) || bpanic "View start can't be zero"
+  (( C_L > 0    )) || bpanic "Current line can't be less than one"
+  (( C_L >= V_S )) || bpanic "Current line can't be off-screen (before view)"
+  (( C_L <= V_E )) || bpanic "Current line can't be off-screen (after view)"
+  (( C_C <= C_W )) || bpanic "Current column can't exceed line width (${C_W})"
+  (( C_C > 0    )) || bpanic "Current column can't be less than 1"
+  (( G_W > 2    )) || bpanic "Gutter must include at least one line number"
+  (( V_E - V_S <= V_H )) || bpanic "View can't span more lines than view can hold"
+
+  case $F_H in
+    1)
+      (( C_L == 1 )) || bpanic "Current line must be one if file only has one line"
+      (( V_S == 1 )) || bpanic "View must start at line 1 if file only has one line"
+      (( V_E == 1 )) || bpanic "View must end at line 1 if file only has one line"
+      ;;
+    *)
+      (( F_H > V_S  )) || bpanic "View must start at least one line from EOF"
+      (( F_H >= V_E )) || bpanic "View end can't exceed file length"
+      (( V_E > V_S  )) || bpanic "View end must be further than view start in multiline files"
+      (( F_H >= C_L )) || bpanic "Current line can't exceed EOF"
+      ;;
+  esac
+}
+
+# Default handler, editing content in the view buffer
+function handle_editor_input() {
+  state_sanity
+  
+  # Queue of lines to redraw, in triplets:
+  # ( line1 start1, mode1, line2, start2, mode2 ) etc
+  # line: Line number in REPL buffer to redraw (will not draw if invisible)
+  # start: Offset (left) at which to start redrawing
+  # mode: 0: Only draw line contents (appr. on insertions)
+  #       1: Contents + clear the rest of the line (appr. on deletions)
+  # gutter: 0: Nothing
+  #         1: Redraw
+  local -a gq_lines=()
+  local key_pressed="${1}"
+  local info_text=''
+
+  # if >= 0, a navigation has occured to C_L from this line
+  # Which will cause 2 full line redraws and two gutter element redraws
+  local -i old_line=-1
+
+  # A line was added or delete. Redraw from here down to V_E
+  local -i v_mod=-1
+
+  case $key_pressed in 
+    CTRL_X)     clean_exit ;;
+    DELETE)     info_text='Special key: DELETE not yet implemented.' ;;
+    BACKSPACE)  info_text='Special key: BACKSPACE not yet implemented.' ;;
+    RUN)        info_text='Special key: RUN not yet implemented.' ;;
+    CTRL_*)     info_text="Macro: ${key_pressed} action not yet implemented." ;;  
+
+    RETURN)
+      # EOL -> begin new empty line
+      # SOL -> insert empty line above
+      # mid -> split and move trail to new line, cursor at 1
+
+      case $C_C in 
+        1)
+          # Move current line down, insert empty line above
+          # new current line = C_L + 1
+          FILE_C=( "${FILE_C[@]:0:${C_L}}" '' "${FILE_C[@]:${C_L}}" )
+          # bpanic "Length: ${#FILE_C[@]}, elements: ${FILE_C[*]}"
+          old_line=$C_L
+          ;;
+
+        $C_W)
+          # Insert new empty line below and go to it
+          FILE_C=( "${FILE_C[@]:0:$((C_L+1))}" '' "${FILE_C[@]:$((C_L+1))}" )
+          old_line=$C_L
+          C_C=1
+          ;;
+
+        *)
+          # Split the line and move trail to new line, with cursor
+          local trail="${FILE_C[${C_L}]:$(( C_C - 1 ))}"
+          # shorten current line to lead
+          FILE_C[${C_L}]="${FILE_C[${C_L}]:0:$(( C_C - 1 ))}"
+          # insert trail as new line
+          FILE_C=( "${FILE_C[@]:0:$((C_L+1))}" "${trail}" "${FILE_C[@]:$((C_L+1))}" )
+          old_line=$C_L
+          C_C=1
+          ;;
+      esac
+
+      (( C_L++ ))
+      v_mod=$(( C_L + 1 ))
+      ;;
+
+    UP)
+      case $C_L in 
+        1) (( C_C == 1 )) && return || C_C=1 ;;   # Jump to start of line
+        *)
+          old_line=$(( C_L-- ))                   # Jump to previous line
+          C_W=$(( ${#FILE_C[$C_L]} + 1 ))
+          C_C=$(( C_C > C_W ? C_W : C_C ))        # Jump back if prev line is shorter
+          ;;
+      esac
+      ;;
+
+    DOWN)
+      case $C_L in
+        $F_H) (( C_C == C_W )) && return || C_C=$C_W ;; # Jump to end of line
+        *)
+          old_line=$(( C_L++ ))                         # Jump to next line
+          C_W=$(( ${#FILE_C[$C_L]} + 1 ))
+          C_C=$(( C_C > C_W ? C_W : C_C ))              # Jump back if next line is shorter
+          ;;
+      esac
+      ;;
+    
+    LEFT)
+      case $C_C in
+        1)
+          (( C_L == 1 )) && return
+          old_line=$(( C_L-- ))
+          C_C=$(( ${#FILE_C[$C_L]} + 1 ))   # Set cursor at end of previous line
+          ;;
+        *) (( C_C-- )) ;;                   # Just move 1 to the left
+      esac
+      ;;
+    
+    RIGHT)
+      case $C_C in
+        $C_W)
+          (( C_L == F_H )) && return
+          old_line=$(( C_L++ )) 
+          C_C=1                         # Set cursor at beginning of next line
+          ;;
+        *) (( C_C++ )) ;;               # Just move 1 to the right
+      esac
+      ;;
+    
+    *)
+      case $key_pressed in
+        SPACE) key_pressed=' ' ;;
+        TAB)
+          local next_tab_stop=$(( TAB_W - ((C_C - 1) % TAB_W) ))
+          key_pressed="$(printf "%-${next_tab_stop}s" '')"
+          ;;
+      esac
+
+      gq_lines+=("${C_L}") # Queue this line for redrawing
+
+      if (( C_C == C_W )); then
+        # Cursor is at EOL, simply append
+        FILE_C[${C_L}]="${FILE_C[${C_L}]}${key_pressed}"
+
+        # Use old line width as start for redraw
+        # bash substitution is 0-based
+        gq_lines+=("${C_W}")
+      else
+        # Cursor is in the middle of the line
+        FILE_C[${C_L}]="${FILE_C[${C_L}]:0:$(( C_C - 1 ))}${key_pressed}${FILE_C[${C_L}]:$(( C_C - 1 ))}"
+        gq_lines+=("${C_C}")
+      fi
+
+      (( C_C += ${#key_pressed} )) # Advance cursor
+      # C_W=$(( ${#FILE_C[$C_L]} + 1 )) # Update current line width
+      gq_lines+=("${MODE_PARTIAL}")
+      gq_lines+=('0') # Dont update gutter
+      ;;
+  esac
+
+  # Update metrics
+  C_W=$(( ${#FILE_C[$C_L]} + 1 )) # Update current line width
+  F_H=$(( ${#FILE_C[@]} - 1 ))
+  V_E=$(( F_H > (V_S + V_H) ? (V_S + V_H) : F_H ))
+
+  # Is a full redraw needed because the gutter changed width?
+  update_gutter_width
+  if (( G_W != G_W_OLD )); then
+    # Full redraw
+    for (( l=V_S; l<=V_E; l++ )); do
+      gq_lines+=("${l}" '1' "${MODE_PAD}" '1')
+    done
+
+    G_W_OLD=$G_W
+  else
+    # queue lines from line change
+    if (( old_line > 0 )); then
+      gq_lines+=("${C_L}" '1' "${MODE_PAD}" '1')
+      gq_lines+=("${old_line}" '1' "${MODE_PAD}" '1') 
+    fi
+
+    # Queue lines from vert insert/delete
+    if (( v_mod > 0 )); then
+      for (( l=v_mod; l<=V_E; l++ )); do
+        gq_lines+=("${l}" '1' "${MODE_PAD}" '1')
+      done
+    fi
+  fi
+
+  # Set the cursor position on screen
+  case $(( C_W > V_W )) in
+    1) V_O=$(( C_W + 1 - V_W )) ;;
+    0) V_O=1 ;;
+  esac
+
+  # Vertical scrolling
+  case $(( C_L - V_S >= V_H )) in
+    1) bpanic "AAAAH!!!!!" ;;
+  esac
+
+  # Horizontal scrolling
+  case $(( C_C >= V_W )) in
+    1) bpanic "UUUUHHH!!!!" ;;
+  esac
+
+
+  tput civis # Hide cursor for drawing purposes
+
+  # Draw info text
+  [[ -n "${info_text}" ]] && gfx_draw_info_banner 'info' "${info_text}"
+
+  # Draw lines
+  local queue_length=${#gq_lines[@]}
+
+  if (( queue_length != 0 && queue_length % 4 != 0)); then
+    gfx_draw_info_banner 'error' 'Invalid line draw queue'
+    return
+  fi
+
+  # TODO: For consequtive lines, use multiline printf to do all at once.
+  # ^ going to deal with this after figuring out the best way to do SH
+
+  if (( queue_length != 0 )); then
+    for (( c=0; c<queue_length; c+=4 )); do
+      (( gq_lines[$((c + 1))] > 0 )) || bpanic "Invalid redraw offset!"
+
+      local start_offset=$(( gq_lines[$((c + 1))] - 1 ))
+      (( start_offset < 0 )) && start_offset=0
+
+      local content_to_print="${FILE_C[${gq_lines[$c]}]:$start_offset}"
+      local h_offset=$(( G_W + ${gq_lines[$((c + 1))]} - V_O ))
+
+      tput cup $(( ${gq_lines[$c]} - V_S )) $h_offset
+
+      tput setaf 15
+      tput setab 235
+
+      case ${gq_lines[$c]} in 
+        $C_L) tput setab 236 ;;
+      esac
+
+      case ${gq_lines[$c + 2]} in
+        $MODE_PARTIAL)
+          printf "%s" "${content_to_print}" ;;
+        $MODE_PAD)
+          local pad_rest=$(( V_W - ${gq_lines[$((c + 1))]} ))
+          printf "%-${pad_rest}s" "${content_to_print}" ;;
+        *)
+          bpanic "Unknown line drawing mode: '${gq_lines[$c + 2]}'!"
+      esac
+
+      (( ${gq_lines[$((c + 3))]} > 0 )) && gfx_draw_single_gutter "${gq_lines[$c]}"
+    done
+  fi
+
+  gfx_draw_left_info  
+
+  state_sanity
+
+  tput cup $(( C_L - V_S )) $(( G_W + C_C - V_O ))
+
+
+  tput cnorm # Show cursor
+}
+
+update_gutter_width() {
+  # The maximum of:
+  # a) The largest line number in the file
+  # b) The largest line number we could fit if file starts at 1 and goes to VB end
+  local max_n=$(( ${#V_H} > ${#F_H} ? ${#V_H} : ${#F_H}))
+  G_W=$(( (G_P * 2) + max_n ))
+  G_RW=$max_n
+}
+
+gfx_draw_right_info() {
+  tput setab 15
+  tput setaf 235
+
+  tput cup $(( T_H - 2 )) $(( T_M + 1 ))
+  printf "%$(( T_W - T_M - 2 ))s " "[^H Help, ^X Quit] (${EC_NAME} ${EC_VERSION})"
+}
+
+gfx_draw_left_info() {
+  tput setab 15
+  tput setaf 235
+
+  tput cup $(( T_H - 2 )) 0
+  printf \
+    " %-${T_M}s" \
+    "REPL (${C_L},${C_C})"
+}
+
+gfx_init_empty() {
+  tput setaf 15
+  tput setab 235
+  tput clear   # Disable to debug partial rendering
+
+  update_gutter_width
+
+  gfx_draw_single_gutter "${C_L}"
+
+  tput setab 236
+
+  # Draw scroll past end gutters
+  for (( g=1; g<=V_H; g++ )); do 
+    tput cup "${g}" 0
+    printf " %${G_RW}s " ''
+  done
+
+  gfx_draw_info_banner 'info' 'Welcome!'
+
+  gfx_draw_left_info
+  gfx_draw_right_info
+
+  tput cup 0 $G_W
+}
+
+gfx_draw_single_gutter() {
+  tput setab 236
+  tput setaf 247
+
+  local line_no="${1}"
+
+  (( line_no == C_L )) && tput setab 235
+
+  (( line_no > F_H )) && line_no=''
+
+  tput cup "$(( ${1} - V_S ))" 0
+  printf " %${G_RW}s " "${line_no}"
+
+}
+
+gfx_draw_info_banner() {
+  local info_level="${1}"
+  local info_content="${2}"
+
+  tput setab 235
+  tput setaf 15
+
+  tput cup $(( T_H - 1 )) 0
+  printf " %-$(( T_W - 1 ))s" "[$(date +%R)] (${info_level}) ${info_content}"
+}
+
+
+
+# Parsing key hashes into proper names and dispatching to handlers
+function parse_user_key() {
+  local khash="${1}"
+  local kraws="${2}"
+  local up_stack="${3}"
+
+  local parsed_key="${kraws}"
+  local short_hash="${khash:4:2}"
+
+  if [[ "${khash}" == '3f2f2f300a' ]]; then
+    parsed_key="${up_stack}RETURN"
+  else
+    case $short_hash in
+      20) parsed_key='SPACE' ;;
+      7f) parsed_key='BACKSPACE' ;;
+      5b) parsed_key='[' ;;
+      44) parsed_key="${up_stack}D" ;;
+      43) parsed_key="${up_stack}C" ;; 
+      41) parsed_key="${up_stack}A" ;;
+      42) parsed_key="${up_stack}B" ;;
+      7e) parsed_key="${up_stack}~" ;;
+      17) parsed_key="CTRL_W" ;;
+      05) parsed_key="CTRL_E" ;;
+      12) parsed_key="CTRL_R" ;;
+      14) parsed_key="CTRL_T" ;;
+      15) parsed_key="CTRL_U" ;;
+      10) parsed_key="CTRL_P" ;;
+      01) parsed_key="CTRL_A" ;;
+      04) parsed_key="CTRL_D" ;;
+      07) parsed_key="CTRL_G" ;;
+      08) parsed_key="CTRL_H" ;;
+      0b) parsed_key="CTRL_K" ;;
+      0c) parsed_key="CTRL_L" ;;
+      18) parsed_key="CTRL_X" ;;
+      02) parsed_key="CTRL_B" ;;
+      0e) parsed_key="CTRL_N" ;;
+      09) parsed_key="TAB" ;;
+    esac
+  fi
+
+  parsed_key="${parsed_key/${KMOD}D/LEFT}"
+  parsed_key="${parsed_key/${KMOD}C/RIGHT}"
+  parsed_key="${parsed_key/${KMOD}A/UP}"
+  parsed_key="${parsed_key/${KMOD}B/DOWN}"
+  parsed_key="${parsed_key/${KMOD}RETURN/RUN}"
+  parsed_key="${parsed_key/${KMOD}\~/DELETE}"
+
+  # Dispatch to handler
+  eval "${KEY_HANDLER} '${parsed_key}'"
+}
+
+
+# Frontend receiving raw keystrokes from the terminal
+function read_user_input() {
+  local special_key_prefix=''
+  local raw_read_var=''
+  local binhash
+
+  while true; do
+    IFS='' read -r -s -n 1 raw_read_var
+
+    # Insert received chars into this special string
+    # by observing the effect, we can weed out special chars
+    binhash="$(xxd -pu <<< "?/$raw_read_var/${#raw_read_var}")"
+
+    # echo -e "\nBINHASH: ${binhash}"
+    
+    # ESC sequence indicating start of special key
+    if [[ "$binhash" == '3f2f1b2f310a' ]]; then
+      special_key_prefix="${KMOD}"
+      continue
+    fi
+
+    # Continuation of special escape sequence
+    if [[ "$special_key_prefix" == "${KMOD}" && "$binhash" == '3f2f5b2f310a' ]]; then
+      continue
+    fi
+
+    # DEL is 3~
+    if [[ "$special_key_prefix" == "${KMOD}" && "$binhash" == '3f2f332f310a' ]]; then
+      continue
+    fi
+
+    parse_user_key "${binhash}" "${raw_read_var}" "${special_key_prefix}"
+    special_key_prefix=''
+  done
+}
+
+trap "clean_exit; exit 1" SIGHUP SIGINT SIGQUIT SIGPIPE SIGTERM
+
+tput sc
+stty -echo # All your input are belong to us
+
+gfx_init_empty
+read_user_input
