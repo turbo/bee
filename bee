@@ -118,6 +118,8 @@ function handle_editor_input() {
 
   case $key_pressed in 
     CTRL_X)     clean_exit ;;
+    CTRL_H)     info_text="You're in a bash text editor! No one can help you now." ;;  
+
     DELETE)     info_text='Special key: DELETE not yet implemented.' ;;
     BACKSPACE)  info_text='Special key: BACKSPACE not yet implemented.' ;;
     RUN)        info_text='Special key: RUN not yet implemented.' ;;
